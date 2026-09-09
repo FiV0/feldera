@@ -1,3 +1,4 @@
+use super::runtime_pool::{RuntimePool, unsupported};
 use crate::circuit::GlobalNodeId;
 use crate::circuit::checkpointer::Checkpointer;
 use crate::circuit::circuit_builder::{CircuitHandle, ConcurrentRestoreOutcome};
@@ -21,12 +22,14 @@ use feldera_types::config::DevTweaks;
 use feldera_types::config::dev_tweaks::{BufferCacheAllocationStrategy, BufferCacheStrategy};
 pub use feldera_types::config::{StorageCacheConfig, StorageConfig, StorageOptions};
 use feldera_types::transaction::CommitProgressSummary;
+use futures::task::AtomicWaker;
 use itertools::Either;
 use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::num::NonZeroUsize;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 use std::{
     collections::HashSet,
@@ -336,6 +339,8 @@ pub enum StepSize {
 /// run the circuit and where they store data, e.g., state typically not
 /// tunable/exposed by the user.
 pub struct CircuitConfig {
+    /// Attach this single-worker circuit to shared execution resources.
+    pub runtime_pool: Option<RuntimePool>,
     /// How the circuit is laid out across one or multiple machines.
     pub layout: Layout,
 
@@ -520,6 +525,7 @@ impl Default for CircuitConfig {
 impl CircuitConfig {
     pub fn with_workers(n: usize) -> Self {
         Self {
+            runtime_pool: None,
             layout: Layout::new_solo(n),
             max_rss_bytes: None,
             pin_cpus: Vec::new(),
@@ -530,6 +536,12 @@ impl CircuitConfig {
             dev_tweaks: DevTweaks::default(),
             exchange_listener: None,
         }
+    }
+
+    /// Run this circuit on shared threads, pinned to one pool worker.
+    pub fn with_runtime_pool(mut self, pool: RuntimePool) -> Self {
+        self.runtime_pool = Some(pool);
+        self
     }
 
     pub fn with_max_rss_bytes(mut self, max_rss: Option<u64>) -> Self {
@@ -711,7 +723,10 @@ impl Runtime {
         F: FnOnce(&mut RootCircuit) -> Result<T, AnyError> + Clone + Send + 'static,
         T: Send + 'static,
     {
-        let config: CircuitConfig = config.into();
+        let mut config: CircuitConfig = config.into();
+        if let Some(pool) = config.runtime_pool.take() {
+            return pool.init(config, constructor);
+        }
         let nworkers = config.layout.local_workers().len();
 
         // When a worker finishes building the circuit, it sends completion status back
@@ -725,8 +740,13 @@ impl Runtime {
             (0..nworkers).map(|_| bounded(1)).unzip();
 
         // Channels used to signal command completion to the client.
-        let (status_senders, status_receivers): (Vec<_>, Vec<_>) =
-            (0..nworkers).map(|_| bounded(1)).unzip();
+        let status_waker = Arc::new(AtomicWaker::new());
+        let (status_senders, status_receivers): (Vec<_>, Vec<_>) = (0..nworkers)
+            .map(|_| {
+                let (sender, receiver) = bounded(1);
+                (StatusSender::new(sender, status_waker.clone()), receiver)
+            })
+            .unzip();
 
         let storage = config.storage.clone();
 
@@ -1163,6 +1183,7 @@ impl Runtime {
             command_senders,
             status_receivers,
             fingerprint,
+            status_waker,
         )?;
         // When `defer_restore` is set the caller drives a concurrent bootstrap
         // (`start_concurrent_bootstrap`) instead of the automatic stop-the-world
@@ -1217,7 +1238,7 @@ enum BootstrapCircuitState {
 }
 
 #[derive(Clone)]
-enum Command {
+pub(super) enum Command {
     StartTransaction,
     Step,
     CommitTransaction,
@@ -1328,7 +1349,7 @@ impl Debug for Command {
 }
 
 #[derive(Debug)]
-enum Response {
+pub(super) enum Response {
     Unit,
     CommitComplete(bool),
     BootstrapComplete(bool),
@@ -1345,9 +1366,73 @@ enum Response {
     CurrentBalancerPolicy(Result<PartitioningPolicy, DbspError>),
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct StatusSender {
+    sender: Option<Sender<Result<Response, DbspError>>>,
+    waker: Arc<AtomicWaker>,
+}
+
+impl StatusSender {
+    pub(super) fn new(
+        sender: Sender<Result<Response, DbspError>>,
+        waker: Arc<AtomicWaker>,
+    ) -> Self {
+        Self {
+            sender: Some(sender),
+            waker,
+        }
+    }
+    pub(super) fn send(
+        &self,
+        result: Result<Response, DbspError>,
+    ) -> Result<(), crossbeam::channel::SendError<Result<Response, DbspError>>> {
+        let result = self.sender.as_ref().unwrap().send(result);
+        self.waker.wake();
+        result
+    }
+}
+
+impl Drop for StatusSender {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        self.waker.wake();
+    }
+}
+
+// Command completion can be waited on from inside another executor, too.
+fn wait_for_command<F: std::future::Future>(future: F) -> F::Output {
+    struct Wake(crossbeam::sync::Unparker);
+    impl std::task::Wake for Wake {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let parker = crossbeam::sync::Parker::new();
+    let waker = std::task::Waker::from(Arc::new(Wake(parker.unparker().clone())));
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(result) => return result,
+            Poll::Pending => parker.park(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PendingTransaction {
+    start: Instant,
+    remaining: Vec<bool>,
+}
+
 /// A handle to control the execution of a circuit in a multithreaded runtime.
 #[derive(Debug)]
 pub struct DBSPHandle {
+    status_waker: Arc<AtomicWaker>,
+    pending_transaction: Option<PendingTransaction>,
     /// Time when the handle was created.
     start_time: Instant,
 
@@ -1439,12 +1524,13 @@ impl WorkersCommitProgress {
 }
 
 impl DBSPHandle {
-    fn new(
+    pub(super) fn new(
         backend: Option<Arc<dyn StorageBackend>>,
         runtime: RuntimeHandle,
         command_senders: Vec<Sender<Command>>,
         status_receivers: Vec<Receiver<Result<Response, DbspError>>>,
         fingerprint: u64,
+        status_waker: Arc<AtomicWaker>,
     ) -> Result<Self, DbspError> {
         // TODO: We allow the circuit to change between suspend and resume in Persistent mode;
         // we therefore only validate the fingerprint in ephemeral mode; however it can sometimes
@@ -1463,6 +1549,8 @@ impl DBSPHandle {
             .transpose()?
             .map(|checkpointer| Arc::new(Mutex::new(checkpointer)));
         Ok(Self {
+            status_waker,
+            pending_transaction: None,
             start_time: Instant::now(),
             runtime: Some(runtime),
             command_senders,
@@ -1501,6 +1589,20 @@ impl DBSPHandle {
             .map(|runtime| runtime.collect_panic_info())
     }
 
+    fn channel_error(&self) -> DbspError {
+        let panic_info = self.collect_panic_info().unwrap_or_default();
+        if panic_info.is_empty()
+            && self
+                .runtime
+                .as_ref()
+                .is_some_and(|handle| handle.runtime().is_pooled())
+        {
+            DbspError::Runtime(RuntimeError::Terminated)
+        } else {
+            DbspError::Runtime(RuntimeError::WorkerPanic { panic_info })
+        }
+    }
+
     fn panicked(&self) -> bool {
         self.runtime
             .as_ref()
@@ -1511,6 +1613,8 @@ impl DBSPHandle {
     where
         F: FnMut(usize, Response),
     {
+        self.check_pool_command(&command)?;
+        self.finish_pending_transaction()?;
         if self.runtime.is_none() {
             return Err(DbspError::Runtime(RuntimeError::Terminated));
         }
@@ -1518,12 +1622,12 @@ impl DBSPHandle {
         // Send command.
         for (worker, sender) in self.command_senders.iter().enumerate() {
             if sender.send(command.clone()).is_err() {
-                let panic_info = self.collect_panic_info().unwrap_or_default();
+                let error = self.channel_error();
 
                 // Worker thread panicked. Exit without waiting for all workers to exit
                 // to avoid deadlocks due to workers waiting for each other.
                 self.kill_async();
-                return Err(DbspError::Runtime(RuntimeError::WorkerPanic { panic_info }));
+                return Err(error);
             }
             self.runtime.as_ref().unwrap().unpark_worker(worker);
         }
@@ -1539,15 +1643,25 @@ impl DBSPHandle {
 
         fn handle_panic(this: &mut DBSPHandle) -> Result<(), DbspError> {
             // Retrieve panic info before killing the circuit.
-            let panic_info = this.collect_panic_info().unwrap_or_default();
+            let error = this.channel_error();
             this.kill_async();
 
-            Err(DbspError::Runtime(RuntimeError::WorkerPanic { panic_info }))
+            Err(error)
         }
 
         // Receive responses.
         for _ in 0..self.status_receivers.len() {
-            let ready = select.select();
+            let ready = loop {
+                if let Ok(ready) = select.try_select() {
+                    break ready;
+                }
+                if self.runtime.as_ref().unwrap().runtime().stopped() {
+                    return handle_panic(self);
+                }
+                if let Ok(ready) = select.select_timeout(Duration::from_millis(100)) {
+                    break ready;
+                }
+            };
             let worker = ready.index();
 
             match ready.recv(&self.status_receivers[worker]) {
@@ -1567,22 +1681,31 @@ impl DBSPHandle {
     }
 
     fn unicast_command(&mut self, worker: usize, command: Command) -> Result<Response, DbspError> {
+        self.check_pool_command(&command)?;
+        self.finish_pending_transaction()?;
         if self.runtime.is_none() {
             return Err(DbspError::Runtime(RuntimeError::Terminated));
         }
 
         // Send command.
         if self.command_senders[worker].send(command.clone()).is_err() {
-            let panic_info = self.collect_panic_info().unwrap_or_default();
+            let error = self.channel_error();
 
             // Worker thread panicked. Exit without waiting for all workers to exit
             // to avoid deadlocks due to workers waiting for each other.
             self.kill_async();
-            return Err(DbspError::Runtime(RuntimeError::WorkerPanic { panic_info }));
+            return Err(error);
         }
         self.runtime.as_ref().unwrap().unpark_worker(worker);
 
-        let reply = match self.status_receivers[worker].recv() {
+        let received = loop {
+            match self.status_receivers[worker].recv_timeout(Duration::from_millis(100)) {
+                Err(crossbeam::channel::RecvTimeoutError::Timeout)
+                    if !self.runtime.as_ref().unwrap().runtime().stopped() => {}
+                received => break received,
+            }
+        };
+        let reply = match received {
             Err(_) => return handle_panic(self),
             Ok(Err(e)) => {
                 let _ = self.kill_inner();
@@ -1594,10 +1717,10 @@ impl DBSPHandle {
         // Receive responses.
         fn handle_panic(this: &mut DBSPHandle) -> Result<Response, DbspError> {
             // Retrieve panic info before killing the circuit.
-            let panic_info = this.collect_panic_info().unwrap_or_default();
+            let error = this.channel_error();
             this.kill_async();
 
-            Err(DbspError::Runtime(RuntimeError::WorkerPanic { panic_info }))
+            Err(error)
         }
         if self.panicked() {
             return handle_panic(self);
@@ -1650,22 +1773,149 @@ impl DBSPHandle {
     /// recorded, so they would be silently missing from the bootstrapped
     /// views after cutover.
     pub fn transaction(&mut self) -> Result<(), DbspError> {
+        wait_for_command(self.transaction_async())
+    }
+
+    /// Execute a transaction without blocking the submitting thread.
+    ///
+    /// Dropping the future leaves submitted work running. The next command on
+    /// this handle first resolves that transaction; killing the handle cancels it.
+    pub async fn transaction_async(&mut self) -> Result<(), DbspError> {
+        self.check_pool_command(&Command::Transaction)?;
+        if self.pending_transaction.is_some() {
+            self.finish_transaction_async().await?;
+        }
         self.check_main_circuit_available()?;
-        let start = Instant::now();
-        let result = self.broadcast_command(Command::Transaction, |_, _| {});
+        if self.runtime.is_none() {
+            return Err(DbspError::Runtime(RuntimeError::Terminated));
+        }
+        self.pending_transaction = Some(PendingTransaction {
+            start: Instant::now(),
+            remaining: vec![true; self.status_receivers.len()],
+        });
+        for (worker, sender) in self.command_senders.iter().enumerate() {
+            if sender.send(Command::Transaction).is_err() {
+                self.pending_transaction = None;
+                let error = self.channel_error();
+                self.kill_async();
+                return Err(error);
+            }
+            self.runtime.as_ref().unwrap().unpark_worker(worker);
+        }
+        self.finish_transaction_async().await
+    }
+
+    fn finish_pending_transaction(&mut self) -> Result<(), DbspError> {
+        if self.pending_transaction.is_some() {
+            wait_for_command(self.finish_transaction_async())?;
+        }
+        Ok(())
+    }
+
+    async fn finish_transaction_async(&mut self) -> Result<(), DbspError> {
+        let cancellation = self
+            .runtime
+            .as_ref()
+            .unwrap()
+            .runtime()
+            .cancellation_token();
+        let receive = futures::future::poll_fn(|cx| {
+            self.status_waker.register(cx.waker());
+            let pending = self.pending_transaction.as_mut().unwrap();
+            for (worker, remaining) in pending.remaining.iter_mut().enumerate() {
+                if !*remaining {
+                    continue;
+                }
+                match self.status_receivers[worker].try_recv() {
+                    Ok(Ok(Response::Unit)) => *remaining = false,
+                    Ok(Ok(_)) => unreachable!("transaction returned a non-unit response"),
+                    Ok(Err(error)) => return Poll::Ready(Err(error)),
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => {
+                        return Poll::Ready(Err(self.channel_error()));
+                    }
+                }
+            }
+            if pending.remaining.iter().any(|remaining| *remaining) {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        });
+        let result =
+            match futures::future::select(Box::pin(receive), Box::pin(cancellation.cancelled()))
+                .await
+            {
+                futures::future::Either::Left((result, _)) => result,
+                futures::future::Either::Right(_) => {
+                    let panic_info = self.collect_panic_info().unwrap_or_default();
+                    Err(DbspError::Runtime(if panic_info.is_empty() {
+                        RuntimeError::Terminated
+                    } else {
+                        RuntimeError::WorkerPanic { panic_info }
+                    }))
+                }
+            };
+        let result = if self.panicked() {
+            Err(self.channel_error())
+        } else {
+            result
+        };
+        let pending = self.pending_transaction.take().unwrap();
         DBSP_STEP.fetch_add(1, Ordering::Relaxed);
         DBSP_STEP_LATENCY_MICROSECONDS
             .lock()
             .unwrap()
-            .record_elapsed(start);
-        if let Some(handle) = self.runtime.as_ref() {
-            self.runtime_elapsed +=
-                start.elapsed() * handle.runtime().layout().local_workers().len() as u32 * 2;
+            .record_elapsed(pending.start);
+        if let Some(handle) = &self.runtime {
+            if handle.runtime().is_pooled() {
+                self.runtime_elapsed = handle.runtime().execution_elapsed();
+            } else {
+                self.runtime_elapsed += pending.start.elapsed()
+                    * handle.runtime().layout().local_workers().len() as u32
+                    * 2;
+            }
         }
+        if result.is_err() {
+            self.kill_async();
+        }
+        result?;
+        self.check_bootstrap_complete()
+    }
 
-        self.check_bootstrap_complete()?;
-
-        result
+    fn check_pool_command(&self, command: &Command) -> Result<(), DbspError> {
+        if let Some(handle) = &self.runtime
+            && handle.runtime().on_own_pool_thread()
+        {
+            return Err(unsupported(
+                "submitting commands from a worker of the same pool",
+            ));
+        }
+        if self
+            .runtime
+            .as_ref()
+            .is_some_and(|handle| handle.runtime().is_pooled())
+        {
+            match command {
+                Command::Checkpoint(_)
+                | Command::Restore(_)
+                | Command::IsBootstrapComplete
+                | Command::CompleteBootstrap
+                | Command::CreateBootstrapCircuit(_)
+                | Command::StartBootstrapTransaction
+                | Command::CommitBootstrapTransaction
+                | Command::StepBootstrapCircuit
+                | Command::BootstrapCommitProgress
+                | Command::DestroyBootstrapCircuit
+                | Command::RestoreConcurrent(_)
+                | Command::SyncBootstrapCircuit
+                | Command::CutoverBootstrapCircuit => {
+                    return Err(unsupported("checkpoint restore and bootstrap"));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Start a transaction.
@@ -1802,6 +2052,7 @@ impl DBSPHandle {
         expected: &[BootstrapCircuitState],
         operation: &str,
     ) -> Result<(), DbspError> {
+        self.check_pool_command(&Command::CreateBootstrapCircuit(None))?;
         if expected.contains(&self.bootstrap_circuit_state) {
             Ok(())
         } else {
@@ -2206,7 +2457,14 @@ impl DBSPHandle {
 
     /// Returns the time elapsed while the circuit is executing a step,
     /// multiplied by the number of foreground and background threads.
+    /// For a pooled circuit, returns its accumulated foreground execution time,
+    /// excluding time waiting in the pool queue and asynchronous merger work.
     pub fn runtime_elapsed(&self) -> Duration {
+        if let Some(handle) = &self.runtime
+            && handle.runtime().is_pooled()
+        {
+            return handle.runtime().execution_elapsed();
+        }
         self.runtime_elapsed
     }
 
@@ -2242,6 +2500,7 @@ impl DBSPHandle {
     }
 
     fn checkpointer(&self) -> Result<&Arc<Mutex<Checkpointer>>, DbspError> {
+        self.check_pool_command(&Command::Checkpoint(StoragePath::from("")))?;
         self.checkpointer
             .as_ref()
             .ok_or(DbspError::Storage(StorageError::StorageDisabled))

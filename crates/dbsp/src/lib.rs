@@ -101,7 +101,8 @@ pub use algebra::{DynZWeight, ZWeight};
 
 pub use circuit::{
     ChildCircuit, Circuit, CircuitBase, CircuitHandle, Consensus, DBSPHandle, NestedCircuit,
-    RootCircuit, Runtime, RuntimeError, SchedulerError, Stream, WeakRuntime,
+    PoolConfig, PoolStats, RootCircuit, Runtime, RuntimeError, RuntimePool, SchedulerError, Stream,
+    WeakRuntime,
 };
 #[cfg(not(feature = "backend-mode"))]
 pub use operator::FilterMap;
