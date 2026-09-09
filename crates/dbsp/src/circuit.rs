@@ -15,6 +15,8 @@
 //! output.
 
 mod dbsp_handle;
+mod runtime_pool;
+pub use runtime_pool::{PoolConfig, PoolStats, RuntimePool};
 
 pub(crate) mod runtime;
 

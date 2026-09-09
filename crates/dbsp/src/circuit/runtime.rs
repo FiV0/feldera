@@ -84,6 +84,8 @@ pub enum Error {
     /// while another exists.
     BootstrapCircuit(String),
     Terminated,
+    InvalidPoolConfig(String),
+    UnsupportedPoolOperation(String),
 }
 
 impl DetailedError for Error {
@@ -92,6 +94,8 @@ impl DetailedError for Error {
             Self::UnknownPersistentId(_) => Cow::from("UnknownPersistentId"),
             Self::WorkerPanic { .. } => Cow::from("WorkerPanic"),
             Self::Terminated => Cow::from("Terminated"),
+            Self::InvalidPoolConfig(_) => Cow::from("InvalidPoolConfig"),
+            Self::UnsupportedPoolOperation(_) => Cow::from("UnsupportedPoolOperation"),
             Self::IncompatibleStorage => Cow::from("IncompatibleStorage"),
             Self::CheckpointParseError(_) => Cow::from("CheckpointParseError"),
             Self::BootstrapCircuit(_) => Cow::from("BootstrapCircuit"),
@@ -102,6 +106,12 @@ impl DetailedError for Error {
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), FmtError> {
         match self {
+            Self::InvalidPoolConfig(message) => {
+                write!(f, "Invalid runtime pool configuration: {message}")
+            }
+            Self::UnsupportedPoolOperation(message) => {
+                write!(f, "Unsupported runtime pool operation: {message}")
+            }
             Self::UnknownPersistentId(persistent_id) => {
                 write!(f, "Unknown persistent node id: {persistent_id}")
             }
@@ -140,6 +150,37 @@ thread_local! {
     /// but is neither a DBSP foreground nor a background thread.
     static CURRENT_THREAD_TYPE: Cell<Option<ThreadType>> = const { Cell::new(None) };
 
+}
+
+// Background tasks can belong to different circuits on the same merger thread.
+tokio::task_local! {
+    pub(crate) static TOKIO_RUNTIME: RefCell<Option<Runtime>>;
+}
+
+fn with_runtime<T>(f: impl FnOnce(&RefCell<Option<Runtime>>) -> T) -> T {
+    let mut f = Some(f);
+    TOKIO_RUNTIME
+        .try_with(|runtime| f.take().unwrap()(runtime))
+        .unwrap_or_else(|_| RUNTIME.with(f.take().unwrap()))
+}
+
+/// Installs one circuit's context for a complete foreground operation.
+pub(super) struct RuntimeGuard {
+    runtime: Option<Runtime>,
+    worker: usize,
+    thread_type: Option<ThreadType>,
+    cache: Option<Arc<BufferCache>>,
+    slabs: Option<Arc<FBufSlabs>>,
+}
+
+impl Drop for RuntimeGuard {
+    fn drop(&mut self) {
+        RUNTIME.set(self.runtime.take());
+        WORKER_INDEX.set(self.worker);
+        CURRENT_THREAD_TYPE.set(self.thread_type);
+        BUFFER_CACHE.set(self.cache.take());
+        set_thread_slab_pool(self.slabs.take());
+    }
 }
 
 // Thread-local variables set for all foreground worker threads.
@@ -272,6 +313,11 @@ struct RuntimeStorage {
 }
 
 struct RuntimeInner {
+    pool: Option<(Runtime, usize)>,
+    pool_root: bool,
+    execution_nanos: AtomicU64,
+    merger_tasks: Mutex<usize>,
+    mergers_done: std::sync::Condvar,
     layout: Layout,
     mode: Mode,
     step_size: StepSize,
@@ -413,7 +459,16 @@ fn map_pin_cpus(config: &CircuitConfig) -> (Vec<CoreId>, Vec<CoreId>) {
 }
 
 impl RuntimeInner {
+    #[cfg(test)]
     fn new(config: CircuitConfig) -> Result<Self, DbspError> {
+        Self::with_resources(config, None, None)
+    }
+
+    fn with_resources(
+        config: CircuitConfig,
+        pool: Option<(Runtime, usize)>,
+        cache_mib: Option<usize>,
+    ) -> Result<Self, DbspError> {
         let nworkers = config.layout.local_workers().len();
         let buffer_cache_strategy = config.dev_tweaks.buffer_cache_strategy();
         let buffer_max_buckets = config.dev_tweaks.buffer_max_buckets;
@@ -448,7 +503,9 @@ impl RuntimeInner {
             None
         };
 
-        let total_cache_bytes = if let Some(storage) = &storage {
+        let total_cache_bytes = if let Some(cache_mib) = cache_mib {
+            cache_mib.saturating_mul(1024 * 1024)
+        } else if let Some(storage) = &storage {
             match storage.options.cache_mib {
                 Some(cache_mib) => cache_mib.saturating_mul(1024 * 1024),
                 None => 256usize
@@ -461,28 +518,40 @@ impl RuntimeInner {
             1
         };
 
-        info!(
-            "Setting up buffer caches: {buffer_cache_strategy:?} {buffer_cache_allocation_strategy:?} buckets={buffer_max_buckets:?} total_size={:?} MiB",
-            total_cache_bytes / (1024 * 1024)
-        );
-        let buffer_caches = build_buffer_caches(
-            nworkers,
-            total_cache_bytes,
-            buffer_cache_strategy,
-            buffer_max_buckets,
-            buffer_cache_allocation_strategy,
-        );
+        if pool.is_none() {
+            info!(
+                "Setting up buffer caches: {buffer_cache_strategy:?} {buffer_cache_allocation_strategy:?} buckets={buffer_max_buckets:?} total_size={:?} MiB",
+                total_cache_bytes / (1024 * 1024)
+            );
+        }
+        let buffer_caches = if let Some((runtime, worker)) = &pool {
+            vec![runtime.inner().buffer_caches[*worker].clone()]
+        } else {
+            build_buffer_caches(
+                nworkers,
+                total_cache_bytes,
+                buffer_cache_strategy,
+                buffer_max_buckets,
+                buffer_cache_allocation_strategy,
+            )
+        };
 
-        info!("Setting up FBuf slab allocators: bytes_per_class={fbuf_slab_bytes_per_class}");
-        let fbuf_slab_allocators = (0..nworkers)
-            .map(|_| {
-                let allocator = Arc::new(FBufSlabs::new(fbuf_slab_bytes_per_class));
-                enum_map! {
-                    ThreadType::Foreground => allocator.clone(),
-                    ThreadType::Background => allocator.clone(),
-                }
-            })
-            .collect();
+        if pool.is_none() {
+            info!("Setting up FBuf slab allocators: bytes_per_class={fbuf_slab_bytes_per_class}");
+        }
+        let fbuf_slab_allocators = if let Some((runtime, worker)) = &pool {
+            vec![runtime.inner().fbuf_slab_allocators[*worker].clone()]
+        } else {
+            (0..nworkers)
+                .map(|_| {
+                    let allocator = Arc::new(FBufSlabs::new(fbuf_slab_bytes_per_class));
+                    enum_map! {
+                        ThreadType::Foreground => allocator.clone(),
+                        ThreadType::Background => allocator.clone(),
+                    }
+                })
+                .collect()
+        };
 
         let (pin_cpus_fg, pin_cpus_bg) = map_pin_cpus(&config);
 
@@ -500,6 +569,19 @@ impl RuntimeInner {
         }
 
         Ok(Self {
+            pool_root: cache_mib.is_some(),
+            execution_nanos: AtomicU64::new(0),
+            merger_tasks: Mutex::new(0),
+            mergers_done: std::sync::Condvar::new(),
+            cancellation_token: pool
+                .as_ref()
+                .map(|(runtime, _)| runtime.cancellation_token().child_token())
+                .unwrap_or_default(),
+            max_rss: pool
+                .as_ref()
+                .and_then(|(runtime, _)| runtime.max_rss_bytes())
+                .or(config.max_rss_bytes),
+            pool,
             pin_cpus_fg,
             pin_cpus_bg,
             layout: config.layout,
@@ -507,7 +589,6 @@ impl RuntimeInner {
             step_size: config.step_size,
             allow_input_during_commit: config.allow_input_during_commit,
             dev_tweaks: config.dev_tweaks,
-            max_rss: config.max_rss_bytes,
             process_rss: AtomicU64::new(process_rss_bytes().unwrap_or_default()),
             memory_pressure: AtomicU8::new(MemoryPressure::Low as u8),
             memory_pressure_epoch: AtomicU64::new(0),
@@ -515,7 +596,6 @@ impl RuntimeInner {
             storage,
             store: TypedDashMap::new(),
             kill_signal: AtomicBool::new(false),
-            cancellation_token: CancellationToken::new(),
             aux_threads: Mutex::new(Vec::new()),
             buffer_caches,
             fbuf_slab_allocators,
@@ -562,6 +642,9 @@ impl RuntimeInner {
     }
 
     fn memory_pressure(&self) -> MemoryPressure {
+        if let Some((runtime, _)) = &self.pool {
+            return runtime.current_memory_pressure();
+        }
         MemoryPressure::try_from(self.memory_pressure.load(Ordering::Relaxed)).unwrap()
     }
 
@@ -604,7 +687,7 @@ fn panic_hook(panic_info: &PanicHookInfo<'_>, default_panic_hook: &dyn Fn(&Panic
     // Call the default panic hook first.
     default_panic_hook(panic_info);
 
-    RUNTIME.with(|runtime| {
+    with_runtime(|runtime| {
         if let Ok(runtime) = runtime.try_borrow()
             && let Some(runtime) = runtime.as_ref()
         {
@@ -689,7 +772,23 @@ impl Runtime {
     where
         F: FnOnce(Parker) + Clone + Send + 'static,
     {
-        let mut config: CircuitConfig = config.into();
+        let config = config.into();
+        if config.runtime_pool.is_some() {
+            return Err(DbspError::Runtime(Error::UnsupportedPoolOperation(
+                "Runtime::run cannot host pooled circuits".into(),
+            )));
+        }
+        Self::run_with_cache(config, circuit, None)
+    }
+
+    pub(super) fn run_with_cache<F>(
+        mut config: CircuitConfig,
+        circuit: F,
+        cache_mib: Option<usize>,
+    ) -> Result<RuntimeHandle, DbspError>
+    where
+        F: FnOnce(Parker) + Clone + Send + 'static,
+    {
         if config.step_size == StepSize::FullSteps {
             config.dev_tweaks.splitter_chunk_size_records = Some(u64::MAX);
         }
@@ -697,7 +796,9 @@ impl Runtime {
         let workers = config.layout.local_workers();
         let num_merger_threads = config.num_merger_threads();
 
-        let runtime = Self(Arc::new(RuntimeInner::new(config)?));
+        let runtime = Self(Arc::new(RuntimeInner::with_resources(
+            config, None, cache_mib,
+        )?));
 
         // Install custom panic hook.
         let default_hook = default_panic_hook();
@@ -707,6 +808,7 @@ impl Runtime {
 
         // Create a tokio runtime for async merger tasks.
         let runtime_clone = runtime.clone();
+        let merger_index = AtomicUsize::new(0);
         let tokio_merger_runtime: TokioRuntime = {
             info!("starting dbsp merger tokio runtime, workers: {num_merger_threads}",);
 
@@ -720,6 +822,14 @@ impl Runtime {
                 })
                 .on_thread_start(move || {
                     set_current_thread_type(ThreadType::Background);
+                    if cache_mib.is_some() {
+                        let index = merger_index.fetch_add(1, Ordering::Relaxed);
+                        if let Some(core) = runtime_clone.inner().pin_cpus_bg.get(index)
+                            && !core_affinity::set_for_current(*core)
+                        {
+                            warn!("failed to pin pool merger {index} to core {}", core.id);
+                        }
+                    }
                     RUNTIME.with(|rt| *rt.borrow_mut() = Some(runtime_clone.clone()));
                 })
                 .thread_stack_size(6 * 1024 * 1024)
@@ -835,6 +945,89 @@ impl Runtime {
         Ok(RuntimeHandle::new(runtime, workers))
     }
 
+    pub(super) fn for_pool(
+        mut config: CircuitConfig,
+        parent: Runtime,
+        worker: usize,
+    ) -> Result<Self, DbspError> {
+        if config.step_size == StepSize::FullSteps {
+            config.dev_tweaks.splitter_chunk_size_records = Some(u64::MAX);
+        }
+        Ok(Self(Arc::new(RuntimeInner::with_resources(
+            config,
+            Some((parent, worker)),
+            None,
+        )?)))
+    }
+
+    pub(super) fn record_execution(&self, duration: Duration) {
+        self.inner()
+            .execution_nanos
+            .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    pub(super) fn execution_elapsed(&self) -> Duration {
+        Duration::from_nanos(self.inner().execution_nanos.load(Ordering::Relaxed))
+    }
+
+    pub(super) fn belongs_to_pool(&self, pool: &Runtime) -> bool {
+        Arc::ptr_eq(&self.0, &pool.0)
+            || self
+                .inner()
+                .pool
+                .as_ref()
+                .is_some_and(|(parent, _)| Arc::ptr_eq(&parent.0, &pool.0))
+    }
+
+    pub(super) fn on_own_pool_thread(&self) -> bool {
+        self.inner().pool.as_ref().is_some_and(|(pool, _)| {
+            Runtime::runtime().is_some_and(|current| current.belongs_to_pool(pool))
+        })
+    }
+
+    pub(super) fn is_pooled(&self) -> bool {
+        self.inner().pool.is_some()
+    }
+
+    pub(super) fn stop(&self) {
+        self.inner().kill_signal.store(true, Ordering::SeqCst);
+        self.inner().cancellation_token.cancel();
+    }
+
+    pub(super) fn stopped(&self) -> bool {
+        self.inner().kill_signal.load(Ordering::SeqCst)
+            || self.inner().cancellation_token.is_cancelled()
+    }
+
+    pub(crate) fn track_merger(&self) -> MergerTaskGuard {
+        *self.inner().merger_tasks.lock().unwrap() += 1;
+        MergerTaskGuard(self.clone())
+    }
+
+    pub(super) fn wait_for_mergers(&self) {
+        let mut count = self.inner().merger_tasks.lock().unwrap();
+        while *count != 0 {
+            count = self.inner().mergers_done.wait(count).unwrap();
+        }
+    }
+
+    pub(super) fn enter(&self) -> RuntimeGuard {
+        let runtime = RUNTIME.replace(Some(self.clone()));
+        let worker = WORKER_INDEX.replace(0);
+        let thread_type = CURRENT_THREAD_TYPE.replace(Some(ThreadType::Foreground));
+        let cache = BUFFER_CACHE.replace(Some(self.get_buffer_cache(0, ThreadType::Foreground)));
+        let slabs = set_thread_slab_pool(Some(
+            self.get_fbuf_slab_allocator(0, ThreadType::Foreground),
+        ));
+        RuntimeGuard {
+            runtime,
+            worker,
+            thread_type,
+            cache,
+            slabs,
+        }
+    }
+
     pub fn downgrade(&self) -> WeakRuntime {
         WeakRuntime(Arc::downgrade(&self.0))
     }
@@ -850,7 +1043,7 @@ impl Runtime {
     /// thread.  When invoked by such a thread, this method returns `None`.
     #[allow(clippy::self_named_constructors)]
     pub fn runtime() -> Option<Runtime> {
-        RUNTIME.with(|rt| rt.borrow().clone())
+        with_runtime(|rt| rt.borrow().clone())
     }
 
     /// Returns this runtime's storage backend, if storage is configured.
@@ -1036,8 +1229,8 @@ impl Runtime {
     pub fn worker_index() -> usize {
         match current_thread_type() {
             Some(ThreadType::Foreground) => WORKER_INDEX.get(),
-            Some(ThreadType::Background) => TOKIO_WORKER_INDEX.get(),
-            None => RUNTIME.with_borrow(|runtime| match runtime {
+            Some(ThreadType::Background) => TOKIO_WORKER_INDEX.try_get().unwrap_or(0),
+            None => with_runtime(|runtime| match &*runtime.borrow() {
                 Some(runtime) => {
                     // We are running in an auxiliary thread.  Treat it like the
                     // first thread in the local runtime.
@@ -1054,9 +1247,9 @@ impl Runtime {
     /// Returns the 0-based index of the current worker within its local host.
     pub fn local_worker_offset() -> usize {
         // Find the lowest-numbered local worker.
-        let local_workers_start = RUNTIME
-            .with(|rt| Some(rt.borrow().as_ref()?.layout().local_workers().start))
-            .unwrap_or_default();
+        let local_workers_start =
+            with_runtime(|rt| Some(rt.borrow().as_ref()?.layout().local_workers().start))
+                .unwrap_or_default();
         Self::worker_index() - local_workers_start
     }
 
@@ -1081,7 +1274,7 @@ impl Runtime {
     /// Prefers `storage.bloom_false_positive_rate` when set; falls back to
     /// the deprecated `dev_tweaks.bloom_false_positive_rate`.
     pub fn bloom_false_positive_rate() -> f64 {
-        let from_storage: Option<f64> = RUNTIME.with(|rt| {
+        let from_storage: Option<f64> = with_runtime(|rt| {
             rt.borrow()
                 .as_ref()?
                 .inner()
@@ -1134,7 +1327,7 @@ impl Runtime {
     }
 
     pub fn memory_pressure() -> Option<MemoryPressure> {
-        RUNTIME.with(|rt| Some(rt.borrow().as_ref()?.inner().memory_pressure()))
+        with_runtime(|rt| Some(rt.borrow().as_ref()?.inner().memory_pressure()))
     }
 
     pub fn current_memory_pressure(&self) -> MemoryPressure {
@@ -1146,10 +1339,16 @@ impl Runtime {
     }
 
     pub fn memory_pressure_epoch(&self) -> u64 {
+        if let Some((runtime, _)) = &self.inner().pool {
+            return runtime.memory_pressure_epoch();
+        }
         self.inner().memory_pressure_epoch.load(Ordering::Relaxed)
     }
 
     pub(crate) fn memory_pressure_notify(&self) -> Arc<Notify> {
+        if let Some((runtime, _)) = &self.inner().pool {
+            return runtime.memory_pressure_notify();
+        }
         self.inner().memory_pressure_notify.clone()
     }
 
@@ -1165,7 +1364,7 @@ impl Runtime {
     /// - `Some(0)` - spill all batches to storage.
     /// - `Some(N)` - spill batches with size >= N to storage.
     pub fn min_merge_storage_bytes() -> Option<usize> {
-        RUNTIME.with(|rt| {
+        with_runtime(|rt| {
             let rt = rt.borrow();
             let inner = rt.as_ref()?.inner();
             let storage = inner.storage.as_ref()?;
@@ -1194,7 +1393,7 @@ impl Runtime {
     /// - `Some(0)` - spill all batches to storage.
     /// - `Some(N)` - spill batches with size >= N to storage.
     pub fn min_insert_storage_bytes() -> Option<usize> {
-        RUNTIME.with(|rt| {
+        with_runtime(|rt| {
             let rt = rt.borrow();
             let inner = rt.as_ref()?.inner();
             let storage = inner.storage.as_ref()?;
@@ -1230,7 +1429,7 @@ impl Runtime {
     /// - `Some(0)` - spill all batches to storage.
     /// - `Some(N)` - spill batches with size >= N to storage.
     pub fn min_step_storage_bytes() -> Option<usize> {
-        RUNTIME.with(|rt| {
+        with_runtime(|rt| {
             let rt = rt.borrow();
             let inner = rt.as_ref()?.inner();
             let storage = inner.storage.as_ref()?;
@@ -1268,7 +1467,7 @@ impl Runtime {
     ///
     /// If this thread is not in a [Runtime], returns 1.
     pub fn num_workers() -> usize {
-        RUNTIME.with(|rt| {
+        with_runtime(|rt| {
             rt.borrow()
                 .as_ref()
                 .map_or(1, |runtime| runtime.layout().n_workers())
@@ -1319,11 +1518,11 @@ impl Runtime {
         // Only a circuit with a `Runtime` can receive a kill signal, which is
         // OK because a kill request can only be sent via a `RuntimeHandle`
         // anyway.
-        RUNTIME.with(|runtime| {
+        with_runtime(|runtime| {
             runtime
                 .borrow()
                 .as_ref()
-                .map(|runtime| runtime.inner().kill_signal.load(Ordering::SeqCst))
+                .map(|runtime| runtime.stopped())
                 .unwrap_or(false)
         })
     }
@@ -1359,6 +1558,15 @@ impl Runtime {
             .write()
             .map(|mut guard| *guard = Some(panic_info));
         self.inner().panicked.store(true, Ordering::Release);
+        if let Some((parent, worker)) = &self.inner().pool {
+            if let Ok(mut info) = parent.inner().panic_info[*worker][thread_type].write() {
+                *info = self.worker_panic_info(local_worker_offset, thread_type);
+            }
+            parent.inner().panicked.store(true, Ordering::Release);
+            parent.stop();
+        } else if self.inner().pool_root {
+            self.stop();
+        }
     }
 
     /// Handle to the tokio merger runtime associated with this DBSP runtime.
@@ -1368,6 +1576,12 @@ impl Runtime {
     /// before dropping it; an in-flight merger task that reaches this accessor
     /// after the take observes `None` and should bail out of its work.
     pub(crate) fn tokio_merger_runtime(&self) -> Option<tokio::runtime::Handle> {
+        if self.stopped() {
+            return None;
+        }
+        if let Some((runtime, _)) = &self.inner().pool {
+            return runtime.tokio_merger_runtime();
+        }
         self.inner()
             .tokio_merger_runtime
             .lock()
@@ -1502,16 +1716,41 @@ where
     }
 }
 
+pub(crate) struct MergerTaskGuard(Runtime);
+impl Drop for MergerTaskGuard {
+    fn drop(&mut self) {
+        let mut count = self.0.inner().merger_tasks.lock().unwrap();
+        *count -= 1;
+        self.0.inner().mergers_done.notify_all();
+    }
+}
+
 /// Handle returned by `Runtime::run`.
 #[derive(Debug)]
 pub struct RuntimeHandle {
+    registration: Option<super::runtime_pool::Registration>,
     runtime: Runtime,
     workers: Vec<(JoinHandle<()>, Unparker)>,
 }
 
 impl RuntimeHandle {
     fn new(runtime: Runtime, workers: Vec<(JoinHandle<()>, Unparker)>) -> Self {
-        Self { runtime, workers }
+        Self {
+            runtime,
+            workers,
+            registration: None,
+        }
+    }
+
+    pub(super) fn pooled(
+        runtime: Runtime,
+        registration: super::runtime_pool::Registration,
+    ) -> Self {
+        Self {
+            runtime,
+            registration: Some(registration),
+            workers: Vec::new(),
+        }
     }
 
     /// Unpark worker thread.
@@ -1520,7 +1759,11 @@ impl RuntimeHandle {
     /// This method unparks a thread after sending a command to it or
     /// when killing a circuit.
     pub(super) fn unpark_worker(&self, worker: usize) {
-        self.workers[worker].1.unpark();
+        if let Some(registration) = &self.registration {
+            registration.wake();
+        } else {
+            self.workers[worker].1.unpark();
+        }
     }
 
     /// Returns reference to the runtime.
@@ -1543,6 +1786,11 @@ impl RuntimeHandle {
     // Signals all worker threads to exit, and returns immediately without
     // waiting for them to exit.
     pub fn kill_async(&self) {
+        if let Some(registration) = &self.registration {
+            self.runtime.stop();
+            registration.wake();
+            return;
+        }
         self.runtime
             .inner()
             .kill_signal
@@ -1567,6 +1815,15 @@ impl RuntimeHandle {
     ///
     /// The calling thread blocks until all worker threads have terminated.
     pub fn join(self) -> ThreadResult<()> {
+        if let Some(registration) = self.registration {
+            let deferred = registration.on_pool_thread();
+            registration.remove();
+            if !deferred {
+                self.runtime.wait_for_mergers();
+                self.runtime.local_store().clear();
+            }
+            return Ok(());
+        }
         // Insist on joining all threads even if some of them fail.
         #[allow(clippy::needless_collect)]
         let results: Vec<ThreadResult<()>> = self
@@ -1645,6 +1902,9 @@ impl RuntimeHandle {
     pub fn collect_panic_info(&self) -> Vec<(usize, ThreadType, WorkerPanicInfo)> {
         let mut result = Vec::new();
 
+        if let Some(registration) = &self.registration {
+            return registration.pool.panic_info();
+        }
         for worker in 0..self.workers.len() {
             for thread_type in [ThreadType::Foreground, ThreadType::Background] {
                 if let Some(panic_info) = self.worker_panic_info(worker, thread_type) {
@@ -1657,6 +1917,9 @@ impl RuntimeHandle {
 
     /// Returns true if any worker has panicked.
     pub fn panicked(&self) -> bool {
+        if let Some(registration) = &self.registration {
+            return registration.pool.panicked();
+        }
         self.runtime.inner().panicked.load(Ordering::Acquire)
     }
 }

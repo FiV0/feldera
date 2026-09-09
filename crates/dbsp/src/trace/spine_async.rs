@@ -24,7 +24,7 @@ use crate::{
         },
         metrics::COMPACTION_STALL_TIME_NANOSECONDS,
         negative_weight_multiplier,
-        runtime::{TOKIO_BUFFER_CACHE, TOKIO_WORKER_INDEX},
+        runtime::{TOKIO_BUFFER_CACHE, TOKIO_RUNTIME, TOKIO_WORKER_INDEX},
     },
     dynamic::{DynVec, Factory},
     storage::{
@@ -120,6 +120,7 @@ pub(crate) const MAX_LEVEL0_BATCH_SIZE_RECORDS: u16 = 14_999;
 pub(crate) const MIN_LEVEL0_MERGE_BATCHES: usize = 8;
 
 fn scope_tokio_merger_locals<F>(
+    runtime: Runtime,
     worker_index: usize,
     buffer_cache: Arc<BufferCache>,
     slab_allocator: Arc<FBufSlabs>,
@@ -128,9 +129,12 @@ fn scope_tokio_merger_locals<F>(
 where
     F: Future,
 {
-    TOKIO_WORKER_INDEX.scope(
-        worker_index,
-        TOKIO_BUFFER_CACHE.scope(buffer_cache, TOKIO_FBUF_SLABS.scope(slab_allocator, future)),
+    TOKIO_RUNTIME.scope(
+        std::cell::RefCell::new(Some(runtime)),
+        TOKIO_WORKER_INDEX.scope(
+            worker_index,
+            TOKIO_BUFFER_CACHE.scope(buffer_cache, TOKIO_FBUF_SLABS.scope(slab_allocator, future)),
+        ),
     )
 }
 
@@ -1301,7 +1305,9 @@ where
             trace!(level, "merger spawn skipped: runtime torn down");
             return;
         };
+        let task_guard = self.runtime.track_merger();
         handle.spawn(async move {
+            let _task_guard = task_guard;
             let buffer_cache = self
                 .runtime
                 .get_buffer_cache(local_worker_offset, ThreadType::Background);
@@ -1312,6 +1318,7 @@ where
 
             // Setup task-local variables for the tokio merger runtime.
             scope_tokio_merger_locals(
+                self.runtime.clone(),
                 self.worker_index,
                 buffer_cache,
                 slab_allocator,
@@ -2461,5 +2468,113 @@ where
 
     fn ro_snapshot(&self) -> SpineSnapshot<B> {
         self.into()
+    }
+}
+
+#[cfg(test)]
+mod runtime_pool_tests {
+    use super::*;
+    use crate::circuit::{CircuitConfig, CircuitStorageConfig, StorageConfig, StorageOptions};
+    use crate::{PoolConfig, RuntimePool};
+
+    #[test]
+    fn merger_tasks_keep_circuit_context_across_yields() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = RuntimePool::start(
+            PoolConfig::with_threads(1)
+                .with_merger_threads(1)
+                .with_cache_mib(4),
+        )
+        .unwrap();
+        let mut circuits = Vec::new();
+        let mut tasks = Vec::new();
+        for id in 0..2 {
+            let path = directory.path().join(id.to_string());
+            std::fs::create_dir(&path).unwrap();
+            let storage = CircuitStorageConfig::for_config(
+                StorageConfig {
+                    path: path.to_string_lossy().into_owned(),
+                    cache: Default::default(),
+                },
+                StorageOptions {
+                    min_storage_bytes: Some(id + 1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let (circuit, _) = Runtime::init_circuit(
+                CircuitConfig::with_workers(1)
+                    .with_runtime_pool(pool.clone())
+                    .with_storage(Some(storage)),
+                |_| Ok(()),
+            )
+            .unwrap();
+            let runtime = circuit.runtime().clone();
+            let cache = runtime.get_buffer_cache(0, ThreadType::Background);
+            let slabs = runtime.get_fbuf_slab_allocator(0, ThreadType::Background);
+            let executor = runtime.tokio_merger_runtime().unwrap();
+            tasks.push(executor.spawn(scope_tokio_merger_locals(
+                runtime,
+                0,
+                cache,
+                slabs,
+                async move {
+                    for _ in 0..20 {
+                        assert_eq!(Runtime::worker_index(), 0);
+                        assert_eq!(Runtime::num_workers(), 1);
+                        assert_eq!(
+                            Runtime::runtime().unwrap().storage_path(),
+                            Some(path.as_path())
+                        );
+                        assert_eq!(Runtime::min_merge_storage_bytes(), Some(id + 1));
+                        tokio::task::yield_now().await;
+                    }
+                },
+            )));
+            circuits.push(circuit);
+        }
+        assert!(Arc::ptr_eq(
+            &circuits[0]
+                .runtime()
+                .get_buffer_cache(0, ThreadType::Foreground),
+            &circuits[1]
+                .runtime()
+                .get_buffer_cache(0, ThreadType::Foreground)
+        ));
+        assert!(Arc::ptr_eq(
+            &circuits[0]
+                .runtime()
+                .get_fbuf_slab_allocator(0, ThreadType::Foreground),
+            &circuits[1]
+                .runtime()
+                .get_fbuf_slab_allocator(0, ThreadType::Foreground)
+        ));
+        futures::executor::block_on(async {
+            for task in tasks {
+                task.await.unwrap();
+            }
+        });
+        drop(circuits);
+        pool.shutdown().unwrap();
+    }
+
+    #[test]
+    fn merger_panic_cancels_every_circuit() {
+        let pool = RuntimePool::start(PoolConfig::with_threads(1).with_merger_threads(1)).unwrap();
+        let (mut circuit, _) = Runtime::init_circuit(
+            CircuitConfig::with_workers(1).with_runtime_pool(pool.clone()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let runtime = circuit.runtime().clone();
+        let executor = runtime.tokio_merger_runtime().unwrap();
+        let cache = runtime.get_buffer_cache(0, ThreadType::Background);
+        let slabs = runtime.get_fbuf_slab_allocator(0, ThreadType::Background);
+        let task = executor.spawn(scope_tokio_merger_locals(runtime, 0, cache, slabs, async {
+            panic!("injected merger panic");
+        }));
+        assert!(futures::executor::block_on(task).unwrap_err().is_panic());
+        assert!(futures::executor::block_on(circuit.transaction_async()).is_err());
+        pool.shutdown().unwrap();
     }
 }
