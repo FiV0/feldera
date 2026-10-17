@@ -98,10 +98,10 @@ pub(crate) const TAG_TIME: u8 = 16;
 pub(crate) const TAG_TIMESTAMP: u8 = 17;
 pub(crate) const TAG_SHORT_INTERVAL: u8 = 18;
 pub(crate) const TAG_LONG_INTERVAL: u8 = 19;
-pub(crate) const TAG_BINARY: u8 = 20;
+pub const TAG_BINARY: u8 = 20;
 pub(crate) const TAG_GEOMETRY: u8 = 21;
 pub(crate) const TAG_UUID: u8 = 22;
-pub(crate) const TAG_ARRAY: u8 = 23;
+pub const TAG_ARRAY: u8 = 23;
 pub(crate) const TAG_MAP: u8 = 24;
 pub(crate) const TAG_TIMESTAMP_TZ: u8 = 25;
 
@@ -136,7 +136,7 @@ impl FlatVariant {
     ///
     /// The bytes must be a valid encoding (produced by this module); no
     /// validation is performed beyond non-emptiness.
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
+    pub fn from_bytes(bytes: &[u8]) -> Self {
         assert!(!bytes.is_empty(), "encoded value cannot be empty");
         FlatVariant {
             buf: Arc::from(bytes),
@@ -146,7 +146,7 @@ impl FlatVariant {
     }
 
     #[inline]
-    pub(crate) fn as_bytes(&self) -> &[u8] {
+    pub fn as_bytes(&self) -> &[u8] {
         &self.buf[self.start as usize..(self.start + self.len) as usize]
     }
 
@@ -368,9 +368,9 @@ impl SizeOf for FlatVariant {
 /// Read access to one encoded array or map: the child count, the range of
 /// each element or key, and the range of each map value, all resolved
 /// through the end-offset tables in O(1) per child.
-pub(crate) struct Container<'a> {
+pub struct Container<'a> {
     body: &'a [u8],
-    pub(crate) count: usize,
+    pub count: usize,
     is_map: bool,
 }
 
@@ -381,7 +381,7 @@ fn read_u32(bytes: &[u8], at: usize) -> u32 {
 
 impl<'a> Container<'a> {
     /// `value` is one complete encoded value with an Array or Map tag.
-    pub(crate) fn new(value: &'a [u8]) -> Self {
+    pub fn new(value: &'a [u8]) -> Self {
         let is_map = match value[0] {
             TAG_ARRAY => false,
             TAG_MAP => true,
@@ -409,7 +409,7 @@ impl<'a> Container<'a> {
 
     /// Range of element `i` (array) or key `i` (map), relative to the start
     /// of the complete value (including its tag byte).
-    pub(crate) fn element(&self, i: usize) -> Range<usize> {
+    pub fn element(&self, i: usize) -> Range<usize> {
         debug_assert!(i < self.count);
         let base = self.payload_base();
         let start = if i == 0 { 0 } else { self.end(0, i - 1) };
@@ -630,7 +630,7 @@ impl EndTable {
 
 impl Writer {
     #[inline]
-    pub(crate) fn scalar(&mut self, tag: u8, payload: &[u8]) -> Range<usize> {
+    pub fn scalar(&mut self, tag: u8, payload: &[u8]) -> Range<usize> {
         let start = self.out.len();
         self.out.push(tag);
         self.out.extend_from_slice(payload);
@@ -639,7 +639,7 @@ impl Writer {
 
     /// Append a complete, already encoded value verbatim.
     #[inline]
-    pub(crate) fn raw(&mut self, value: &[u8]) -> Range<usize> {
+    pub fn raw(&mut self, value: &[u8]) -> Range<usize> {
         let start = self.out.len();
         self.out.extend_from_slice(value);
         start..self.out.len()
@@ -714,7 +714,7 @@ impl Writer {
     }
 
     /// Assemble an array from child value ranges within this writer.
-    pub(crate) fn array(&mut self, children: &[Range<usize>]) -> Range<usize> {
+    pub fn array(&mut self, children: &[Range<usize>]) -> Range<usize> {
         let start = self.out.len();
         self.out.push(TAG_ARRAY);
         self.out
@@ -1129,7 +1129,11 @@ pub(crate) fn build_document<E>(
 }
 
 /// [`build_document`] for encoders that cannot fail.
-pub(crate) fn build_document_infallible(
+///
+/// Public so other crates can build documents with [`Writer`]; not part of
+/// the supported API.
+#[doc(hidden)]
+pub fn build_document_infallible(
     enc: impl FnOnce(&mut Writer) -> Range<usize>,
 ) -> FlatVariant {
     match build_document::<std::convert::Infallible>(|w| Ok(enc(w))) {
@@ -1360,7 +1364,7 @@ pub struct ArchivedFlatVariant {
 
 impl ArchivedFlatVariant {
     #[inline]
-    pub(crate) fn as_bytes(&self) -> &[u8] {
+    pub fn as_bytes(&self) -> &[u8] {
         self.bytes.as_slice()
     }
 }
