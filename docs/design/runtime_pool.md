@@ -110,48 +110,6 @@ Storage contents are removed when the evaluation exits normally.
 Use the same build profile when comparing runs. These workloads establish a
 runtime-overhead baseline; they are not a Triplox throughput or latency guarantee.
 
-## Evaluation recorded on 2026-09-09
-
-These runs used an unoptimized debug build on Linux x86-64 with 16 available
-logical CPUs, based on upstream commit `8fc1b417d`. Each query processed four
-alternating insertion/retraction transactions with forced spill. Pool runs used
-eight foreground threads, four merger threads, and a total 256 MiB cache budget.
-The machine was also building and running tests, so timings are illustrative,
-not a controlled performance comparison. Local builds used `CFLAGS=-std=gnu17`
-for the pinned mimalloc dependency with GCC 15; no repository toolchain settings
-were changed.
-
-| Circuits | Workload | Process threads | Init (s) | Transactions/s | Idle / sampled peak RSS (MiB) |
-| ---: | --- | ---: | ---: | ---: | ---: |
-| 1 | pool, distinct | 14 | 0.00 | 231 | 27.7 / 30.3 |
-| 100 | pool, distinct | 14 | 0.19 | 865 | 30.6 / 56.4 |
-| 1,000 | pool, distinct | 14 | 2.12 | 1,621 | 78.2 / 286.3 |
-| 10,000 | pool, distinct | 14 | 19.00 | 1,777 | 527.4 / 2202.0 |
-| 1,000 | pool, 1% joins | 14 | 1.84 | 587 | 76.8 / 333.0 |
-| 100 | dedicated, distinct | 301 | 0.50 | 1,689 | 142.3 / 220.2 |
-
-Every output was verified. All runs returned to one process thread and six open
-file descriptors after teardown, with zero registered circuits. The 10,000-query
-run completed 40,000 steps; the mixed run completed 9,120 steps, exercising
-transactions that return to the scheduling queue between steps.
-
-The 10,000-query run used 40,010 open file descriptors before teardown and took
-3.90 seconds to tear down. Sampled RSS remained about 2,171 MiB afterward despite
-releasing the pool, so these measurements do not establish that all memory is
-returned to the OS. Allocator retention and live-allocation profiling need a
-separate investigation. The cache budget limits cache contents, not total query
-memory. The dedicated baseline used 100 foreground, 100 merger, and 100 RSS
-monitor threads, with a separate 256 MiB cache budget per circuit.
-
-A repeat with the final code again verified all 40,000 transactions and the same
-thread/file-descriptor counts. Initialization took 20.84 seconds, execution 37.16
-seconds, and teardown 35.84 seconds while other builds and tests were active.
-This variation reinforces that these runs establish correctness and thread sharing,
-not a latency bound. The repeat report is `pool-10000-final.json`.
-
-Full local JSON reports and validation logs are saved under the ignored
-`target/runtime-pooling-evaluation/` directory.
-
 ## Regression coverage
 
 The pool integration suite covers dedicated/pooled output parity and retractions,
