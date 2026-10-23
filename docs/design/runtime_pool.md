@@ -109,33 +109,3 @@ Storage contents are removed when the evaluation exits normally.
 
 Use the same build profile when comparing runs. These workloads establish a
 runtime-overhead baseline; they are not a Triplox throughput or latency guarantee.
-
-## Regression coverage
-
-The pool integration suite covers dedicated/pooled output parity and retractions,
-worker affinity, per-circuit configuration, concurrent physical workers,
-step-boundary fairness, spill/compaction, constructor and scheduler errors,
-pool-wide panic propagation, canceled transaction futures, deferred cleanup from
-a pool worker, shutdown during registration, concurrent shutdown callers, and repeated
-registration/removal.
-The existing circuit-wait-time integration suite also passes. Internal merger
-tests exercise task-local context across yields and background panic propagation.
-
-Clippy completed for the DBSP library, example, and integration tests. Rust 1.95
-reports six existing warnings in circuit metadata, row-number evaluation, and
-storage readers; no warnings remain in the added or changed pool code.
-
-The workspace-wide compile check stopped at the native `rdkafka-sys` dependency:
-this environment lacks `pkg-config`, which it needs to locate librdkafka 2.12.1.
-DBSP compiled in that check, but a full workspace build is not verified.
-
-The final integration run passed 19 tests (16 pool tests and 3 existing profiler
-wait-time tests). Both internal merger tests passed when run directly. Rustdoc
-passed 58 examples, with 18 existing examples ignored.
-
-The full 649-test DBSP unit suite completed with **646 passed, 3 existing tests
-ignored, and no failures**. After 287 tests completed with two test workers, the
-unfinished tests were resumed using the same compiled binary with six test
-workers and unchanged property-test case counts. An exact-name coverage ledger
-verified that all 649 tests were accounted for across the two runs; see
-`unit-test-validation.json` and `unit-test-resume.json` in the report directory.
